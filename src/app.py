@@ -1,8 +1,9 @@
 """
 High School Management System API
 
-A super simple FastAPI application that allows students to view and sign up
+A FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
+Uses MongoDB for persistent data storage.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -10,17 +11,13 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="Mergington High School API",
-              description="API for viewing and signing up for extracurricular activities")
+from database import connect_to_mongo, close_mongo, get_db
+from models import Activity, ActivityResponse, SignupRequest
 
-# Mount the static files directory
-current_dir = Path(__file__).parent
-app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
-          "static")), name="static")
-
-# In-memory activity database
-activities = {
+# Default activities for initial setup
+DEFAULT_ACTIVITIES = {
     "Chess Club": {
         "description": "Learn strategies and compete in chess tournaments",
         "schedule": "Fridays, 3:30 PM - 5:00 PM",
@@ -78,55 +75,140 @@ activities = {
 }
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle - connect/disconnect from MongoDB"""
+    # Startup
+    connect_to_mongo()
+    db = get_db()
+    
+    # Initialize database with default activities if empty
+    activities_collection = db["activities"]
+    if activities_collection.count_documents({}) == 0:
+        print("📚 Initializing database with default activities...")
+        for name, data in DEFAULT_ACTIVITIES.items():
+            activities_collection.insert_one({
+                "name": name,
+                "description": data["description"],
+                "schedule": data["schedule"],
+                "max_participants": data["max_participants"],
+                "participants": data["participants"]
+            })
+        print(f"✓ Loaded {len(DEFAULT_ACTIVITIES)} activities into database")
+    
+    yield
+    
+    # Shutdown
+    close_mongo()
+
+
+app = FastAPI(
+    title="Mergington High School API",
+    description="API for viewing and signing up for extracurricular activities",
+    lifespan=lifespan
+)
+
+# Mount the static files directory
+current_dir = Path(__file__).parent
+app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
+          "static")), name="static")
+
+
 @app.get("/")
 def root():
+    """Redirect to static index page"""
     return RedirectResponse(url="/static/index.html")
 
 
 @app.get("/activities")
 def get_activities():
-    return activities
+    """Get all activities with their current participant information"""
+    db = get_db()
+    activities_collection = db["activities"]
+    
+    activities = list(activities_collection.find({}, {"_id": 0}))
+    
+    # Format response
+    result = {}
+    for activity in activities:
+        result[activity["name"]] = {
+            "description": activity["description"],
+            "schedule": activity["schedule"],
+            "max_participants": activity["max_participants"],
+            "participants": activity.get("participants", [])
+        }
+    
+    return result
 
 
 @app.post("/activities/{activity_name}/signup")
 def signup_for_activity(activity_name: str, email: str):
     """Sign up a student for an activity"""
+    db = get_db()
+    activities_collection = db["activities"]
+    
     # Validate activity exists
-    if activity_name not in activities:
+    activity = activities_collection.find_one({"name": activity_name})
+    if not activity:
         raise HTTPException(status_code=404, detail="Activity not found")
-
-    # Get the specific activity
-    activity = activities[activity_name]
-
+    
     # Validate student is not already signed up
-    if email in activity["participants"]:
+    if email in activity.get("participants", []):
         raise HTTPException(
             status_code=400,
             detail="Student is already signed up"
         )
-
-    # Add student
-    activity["participants"].append(email)
+    
+    # Check if activity is at capacity
+    participants = activity.get("participants", [])
+    if len(participants) >= activity["max_participants"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Activity is at maximum capacity"
+        )
+    
+    # Add student to activity
+    activities_collection.update_one(
+        {"name": activity_name},
+        {"$push": {"participants": email}}
+    )
+    
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
 @app.delete("/activities/{activity_name}/unregister")
 def unregister_from_activity(activity_name: str, email: str):
     """Unregister a student from an activity"""
+    db = get_db()
+    activities_collection = db["activities"]
+    
     # Validate activity exists
-    if activity_name not in activities:
+    activity = activities_collection.find_one({"name": activity_name})
+    if not activity:
         raise HTTPException(status_code=404, detail="Activity not found")
-
-    # Get the specific activity
-    activity = activities[activity_name]
-
+    
     # Validate student is signed up
-    if email not in activity["participants"]:
+    if email not in activity.get("participants", []):
         raise HTTPException(
             status_code=400,
             detail="Student is not signed up for this activity"
         )
-
-    # Remove student
-    activity["participants"].remove(email)
+    
+    # Remove student from activity
+    activities_collection.update_one(
+        {"name": activity_name},
+        {"$pull": {"participants": email}}
+    )
+    
     return {"message": f"Unregistered {email} from {activity_name}"}
+
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    try:
+        db = get_db()
+        db.command('ping')
+        return {"status": "healthy", "database": "connected"}
+    except Exception as e:
+        return {"status": "unhealthy", "database": "disconnected", "error": str(e)}
